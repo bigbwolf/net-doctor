@@ -231,15 +231,30 @@ cmd_scan() {
 
 # ---------- dispatch ---------------------------------------------------------
 
+cmd_auth() {
+  need_helper
+  echo "Asking macOS for Location Services access so network names show in \`net scan\`."
+  echo "A dialog should appear for your terminal app. Click Allow."
+  local r; r=$("$WIFIINFO" auth)
+  case "${r#status=}" in
+    granted) echo "Granted. Network names will now appear." ;;
+    denied)  echo "Denied. To change it: System Settings › Privacy & Security › Location Services, turn on your terminal app." ;;
+    timeout) echo "No answer within two minutes. If no dialog appeared, your terminal app may already be listed in System Settings › Privacy & Security › Location Services; turn it on there." ;;
+    *)       echo "Result: $r" ;;
+  esac
+}
+
 case "${1:-}" in
   check) cmd_check ;;
   scan)  cmd_scan ;;
+  auth)  cmd_auth ;;
   *)
     cat <<EOF
 net — says in plain words why the Mac's internet is failing
 
   net check   diagnose the current connection and give a verdict
   net scan    nearby Wi-Fi networks and which channel block is quietest
+  net auth    one-time: allow Location Services so scan shows network names
 
 Diagnosis never needs sudo.
 EOF

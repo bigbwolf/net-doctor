@@ -31,6 +31,7 @@ Verdict:
 |---|---|
 | `net check` | Diagnose the current connection: radio quality, driver stalls in the last 10 minutes, then router → internet → DNS → HTTPS probes, then a verdict |
 | `net scan` | Nearby Wi-Fi networks with channel, width and signal; which 5 GHz channel block is quietest from where you sit |
+| `net auth` | One-time: ask macOS for Location Services so `scan` can show network names |
 
 Diagnosis never needs `sudo`.
 

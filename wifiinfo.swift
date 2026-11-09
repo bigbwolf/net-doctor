@@ -3,6 +3,7 @@
 //   wifiinfo scan   one line per nearby network: channel width band rssi bssid ssid
 // SSIDs and BSSIDs are empty unless the calling terminal has Location Services access.
 
+import CoreLocation
 import CoreWLAN
 import Foundation
 
@@ -100,7 +101,30 @@ case "scan":
         print("\(ch?.channelNumber ?? 0)\t\(widthMHz(ch?.channelWidth ?? .widthUnknown))\t\(bandName(ch?.channelBand ?? .bandUnknown))\t\(n.rssiValue)\t\(n.bssid ?? "")\t\(n.ssid ?? "")")
     }
 
+case "auth":
+    // Ask for Location Services so CoreWLAN will show network names. macOS attributes
+    // the request to the terminal app running us, which is what the user grants.
+    final class Delegate: NSObject, CLLocationManagerDelegate {
+        func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+            switch m.authorizationStatus {
+            case .notDetermined: return            // prompt is up; keep waiting
+            case .authorizedAlways, .authorized: print("status=granted")
+            case .denied: print("status=denied")
+            case .restricted: print("status=restricted")
+            @unknown default: print("status=unknown")
+            }
+            exit(0)
+        }
+    }
+    let manager = CLLocationManager()
+    let delegate = Delegate()
+    manager.delegate = delegate
+    manager.requestWhenInUseAuthorization()
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 120))
+    print("status=timeout")
+    exit(1)
+
 default:
-    print("usage: wifiinfo [info|scan]")
+    print("usage: wifiinfo [info|scan|auth]")
     exit(2)
 }

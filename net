@@ -1,0 +1,247 @@
+#!/bin/zsh
+# net — says in plain words why the Mac's internet is failing.
+#   net check   diagnose the current connection and give a verdict
+#   net scan    nearby Wi-Fi networks and channel occupancy
+# Diagnosis never needs sudo.
+
+set -u
+HERE="${0:A:h}"
+WIFIINFO="$HERE/wifiinfo"
+LOG=/usr/bin/log          # zsh has a builtin named `log`
+
+bold() { print -P "%B$*%b"; }
+dim()  { print -P "%F{8}$*%f"; }
+row()  { printf "  %-9s %s\n" "$1" "$2"; }
+
+need_helper() {
+  if [[ ! -x "$WIFIINFO" ]]; then
+    print -u2 "wifiinfo helper not built. Run: make -C $HERE"
+    exit 1
+  fi
+}
+
+# ---------- shared probes ----------------------------------------------------
+
+# ping_stats HOST COUNT -> sets PLOSS (percent) and PAVG (ms, or "-")
+ping_stats() {
+  local out
+  out=$(ping -c "$2" -i 0.2 -t 6 "$1" 2>/dev/null)
+  PLOSS=$(print -r -- "$out" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p')
+  PLOSS=${PLOSS%%.*}; PLOSS=${PLOSS:-100}
+  PAVG=$(print -r -- "$out" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')
+  PAVG=${PAVG%%.*}; PAVG=${PAVG:--}
+}
+
+# dns_ms SERVER NAME -> prints query time in ms, or "fail"
+dns_ms() {
+  local t
+  t=$(dig +time=2 +tries=1 @"$1" "$2" 2>/dev/null | sed -n 's/.*Query time: \([0-9]*\) msec.*/\1/p')
+  [[ -n "$t" ]] && print "$t" || print fail
+}
+fmt_ms() { [[ "$1" == fail ]] && print fail || print "$1 ms"; }
+
+# https_probe -> sets HCODE and HTIME
+https_probe() {
+  local r
+  r=$(curl -s -o /dev/null -m 8 -w '%{http_code} %{time_total}' https://www.google.com/generate_204 2>/dev/null)
+  HCODE=${r%% *}; HTIME=${r##* }
+  [[ "$HCODE" == "000" || -z "$HCODE" ]] && HCODE=fail
+  HTIME=$(awk -v t="$HTIME" 'BEGIN{printf "%d", t*1000}')
+}
+
+# ---------- check ------------------------------------------------------------
+
+cmd_check() {
+  need_helper
+  bold "net check  $(date '+%H:%M:%S')"
+  echo
+
+  # Which interface carries the default route?
+  local IF GW IP DNS1 SVC
+  IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+  if [[ -z "$IF" ]]; then
+    row "Link" "no default route — not connected to any network"
+    echo; bold "Verdict:"; echo "  The Mac is not on a network at all. Turn Wi-Fi on or plug in."
+    return
+  fi
+  IP=$(ipconfig getifaddr "$IF" 2>/dev/null)
+  GW=$(ipconfig getoption "$IF" router 2>/dev/null)
+  DNS1=$(ipconfig getoption "$IF" domain_name_server 2>/dev/null)
+  [[ -z "$DNS1" ]] && DNS1=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3; exit}')
+  SVC=$(networksetup -listallhardwareports 2>/dev/null | awk -v d="$IF" '/Hardware Port/{p=$0; sub(/Hardware Port: /,"",p)} /Device:/ && $2==d {print p}')
+  row "Link" "${SVC:-$IF} ($IF) → $IP, router ${GW:--}, DNS ${DNS1:--}"
+
+  # Radio readings, only when the default route is the Wi-Fi interface.
+  local WIFI_IF ON_WIFI=0 RSSI=0 NOISE=0 SNR=0 CH=0 W=0 BAND="" TX=0 SNR_WORD=""
+  WIFI_IF=$(networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi/{getline; print $2}')
+  local STALLS=0 TIMEOUTS=0 CCAMAX="-" LOGRSSI="" LOGNOISE=""
+  if [[ "$IF" == "$WIFI_IF" ]]; then
+    ON_WIFI=1
+    local kv; typeset -A W_INFO
+    while IFS='=' read -r k v; do W_INFO[$k]="$v"; done < <("$WIFIINFO" info)
+    RSSI=${W_INFO[rssi]:-0}; NOISE=${W_INFO[noise]:-0}; CH=${W_INFO[channel]:-0}
+    W=${W_INFO[width]:-0}; BAND=${W_INFO[band]:-}; TX=${W_INFO[txrate]:-0}
+
+    # Driver log: stall counters, channel-busy %, and the RSSI/noise the driver saw
+    # (newer macOS hides the connected link's RSSI from CoreWLAN; the log still has it).
+    print -n -u2 "  reading Wi-Fi driver log (10 min)…"
+    local DRV
+    DRV=$($LOG show --last 10m --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS "DPS Symptoms" OR eventMessage CONTAINS "Datapath timeout" OR eventMessage CONTAINS "APPLE80211_M_RSSI_CHANGED")' 2>/dev/null)
+    print -u2 -n "\r\e[2K"
+    STALLS=$(print -r -- "$DRV" | grep -c 'DPS Symptoms')
+    TIMEOUTS=$(print -r -- "$DRV" | grep -c 'Datapath timeout')
+    CCAMAX=$(print -r -- "$DRV" | grep -o 'CCA:[0-9]*' | cut -d: -f2 | sort -n | tail -1)
+    CCAMAX=${CCAMAX:--}
+    LOGRSSI=$(print -r -- "$DRV" | grep -o 'RSSI -[0-9]* noise -[0-9]*' | tail -1 | awk '{print $2}')
+    LOGNOISE=$(print -r -- "$DRV" | grep -o 'RSSI -[0-9]* noise -[0-9]*' | tail -1 | awk '{print $4}')
+    [[ "$RSSI" == "0" && -n "$LOGRSSI" ]] && RSSI=$LOGRSSI
+    [[ "$NOISE" == "0" && -n "$LOGNOISE" ]] && NOISE=$LOGNOISE
+
+    if [[ "$RSSI" != "0" && "$NOISE" != "0" ]]; then
+      SNR=$(( RSSI - NOISE ))
+      if   (( SNR >= 25 )); then SNR_WORD=good
+      elif (( SNR >= 15 )); then SNR_WORD=fair
+      else SNR_WORD=poor; fi
+      row "Radio" "ch $CH ($BAND GHz, ${W} MHz) · signal ${RSSI} dBm · noise ${NOISE} dBm · SNR ${SNR} dB ($SNR_WORD) · ${TX} Mb/s"
+    else
+      row "Radio" "ch $CH ($BAND GHz, ${W} MHz) · ${TX} Mb/s · signal not readable right now"
+    fi
+    if (( STALLS + TIMEOUTS == 0 )); then
+      row "Stalls" "last 10 min: none logged by the driver"
+    else
+      local busy=""; [[ "$CCAMAX" != "-" ]] && busy=", channel busy up to ${CCAMAX}%"
+      row "Stalls" "last 10 min: $STALLS driver stalls, $TIMEOUTS datapath timeouts$busy"
+    fi
+  fi
+
+  # Layered probes: router → internet → DNS via router → DNS direct → HTTPS
+  local RLOSS=- RAVG=- ILOSS IAVG DNS_R DNS_D
+  if [[ -n "$GW" ]]; then
+    ping_stats "$GW" 10; RLOSS=$PLOSS; RAVG=$PAVG
+    row "Router" "$GW: ${RLOSS}% loss, avg ${RAVG} ms"
+  fi
+  ping_stats 1.1.1.1 10; ILOSS=$PLOSS; IAVG=$PAVG
+  row "Internet" "1.1.1.1: ${ILOSS}% loss, avg ${IAVG} ms"
+  DNS_R=$(dns_ms "${DNS1:-$GW}" apple.com)
+  DNS_D=$(dns_ms 1.1.1.1 apple.com)
+  row "DNS" "via ${DNS1:-router}: $(fmt_ms $DNS_R) · direct 1.1.1.1: $(fmt_ms $DNS_D)"
+  https_probe
+  if [[ "$HCODE" == fail ]]; then row "HTTPS" "google.com/generate_204: failed"
+  else row "HTTPS" "google.com/generate_204: HTTP $HCODE in ${HTIME} ms"; fi
+
+  # Things that intercept traffic
+  local PROXY="none" VPN FILTERS
+  if scutil --proxy | grep -qE '(HTTPEnable|HTTPSEnable|SOCKSEnable|ProxyAutoConfigEnable) : 1'; then PROXY="system proxy ON"; fi
+  if env | grep -qiE '^(https?|all)_proxy='; then PROXY="$PROXY, proxy env vars set"; fi
+  VPN=$(scutil --nc list 2>/dev/null | grep -c '(Connected)')
+  FILTERS=$(systemextensionsctl list 2>/dev/null | grep -c 'activated enabled')
+  row "Config" "proxy: $PROXY · VPN connected: $VPN · network extensions enabled: $FILTERS"
+
+  # ---------- verdict ----------
+  echo; bold "Verdict:"
+  local v
+  if (( ON_WIFI )) && [[ "$RLOSS" != "-" ]] && { (( RLOSS >= 30 )) || (( STALLS > 0 )) || (( TIMEOUTS > 0 )); }; then
+    v="The Wi-Fi link between this Mac and the router is the problem."
+    (( RLOSS >= 30 )) && v="$v ${RLOSS}% of pings to the router are lost."
+    (( STALLS + TIMEOUTS > 0 )) && v="$v The driver logged $STALLS stalls and $TIMEOUTS timeouts in 10 minutes."
+    [[ "$CCAMAX" != "-" ]] && (( CCAMAX >= 70 )) && v="$v The channel was up to ${CCAMAX}% busy: a crowded channel, not a bad router."
+    [[ -n "$SNR_WORD" && "$SNR_WORD" == poor ]] && v="$v Signal margin is only ${SNR} dB, which makes it fragile."
+    v="$v Try: move closer, change the router's 5 GHz channel (run \`net scan\` to pick one), or use the 2.4 GHz network."
+  elif [[ "$RLOSS" != "-" ]] && (( RLOSS < 30 )) && (( ILOSS >= 30 )); then
+    v="The router is reachable but the internet behind it is not. This is the router's uplink or the ISP, not this Mac. Other devices on the network should be failing too; power-cycle the router if they are."
+  elif (( ILOSS < 30 )) && [[ "$DNS_R" == fail && "$DNS_D" != fail ]]; then
+    v="Internet works but the router's DNS (${DNS1:-router}) is not answering. Set the Mac's DNS to 1.1.1.1 or 8.8.8.8 as a workaround, or restart the router."
+  elif (( ILOSS < 30 )) && [[ "$DNS_R" == fail && "$DNS_D" == fail ]]; then
+    v="Internet works but no DNS server answers, even directly. Something between here and the internet is blocking DNS: a VPN, a filter, or a captive portal. Open a browser and check for a login page."
+  elif (( ILOSS < 30 )) && [[ "$HCODE" == fail ]]; then
+    v="Ping and DNS work but HTTPS fails. That points at something intercepting traffic: a proxy, a VPN, or a network extension (see Config). Disconnect the VPN or disable the proxy and re-run."
+  else
+    v="Everything is working right now."
+    if (( ON_WIFI )) && [[ -n "$SNR_WORD" ]]; then
+      case $SNR_WORD in
+        poor) v="$v But the Wi-Fi margin is thin (SNR ${SNR} dB); expect stalls when the channel gets busy. \`net scan\` shows quieter channels." ;;
+        fair) v="$v Wi-Fi margin is fair (SNR ${SNR} dB)." ;;
+        good) v="$v Wi-Fi link is healthy (SNR ${SNR} dB)." ;;
+      esac
+    fi
+    (( VPN > 0 )) && v="$v A VPN is connected; if an app still fails, it is the first thing to suspect."
+  fi
+  print -- "  $v" | fold -s -w 96 | sed '2,$s/^/  /'
+}
+
+# ---------- scan -------------------------------------------------------------
+
+cmd_scan() {
+  need_helper
+  bold "net scan  $(date '+%H:%M:%S')"
+  print -u2 "  scanning…\c"
+  local SCAN; SCAN=$("$WIFIINFO" scan)
+  print -u2 -n "\r\e[2K"
+
+  typeset -A CUR; while IFS='=' read -r k v; do CUR[$k]="$v"; done < <("$WIFIINFO" info)
+  local curch=${CUR[channel]:-0}
+  echo
+  printf "  %-4s %-6s %-5s %-9s %s\n" ch width band signal name
+  local hidden=0
+  print -r -- "$SCAN" | while IFS=$'\t' read -r ch w band rssi bssid ssid; do
+    local mark=" "; [[ "$ch" == "$curch" && "$curch" != 0 ]] && mark="*"
+    [[ -z "$ssid" ]] && { ssid="(name hidden)"; hidden=1; }
+    printf " %s%-4s %-6s %-5s %-9s %s\n" "$mark" "$ch" "${w}MHz" "$band" "${rssi} dBm" "$ssid"
+  done
+  print -r -- "$SCAN" | grep -q $'\t$' && dim "  Names are hidden because Terminal lacks Location Services access (System Settings › Privacy & Security › Location Services)."
+  [[ "$curch" != 0 ]] && dim "  * = the channel this Mac is on (ch $curch)"
+
+  # 5 GHz occupancy by 80 MHz block
+  echo; bold "  5 GHz channel blocks"
+  local -a blocks; blocks=("36-48" "52-64" "100-112" "116-128" "132-144" "149-161")
+  local best="" bestn=999 curblock="" curn=-1
+  for b in $blocks; do
+    local lo=${b%-*} hi=${b#*-} n=0 strongest=-200
+    while IFS=$'\t' read -r ch w band rssi rest; do
+      [[ "$band" != "5" ]] && continue
+      if (( ch >= lo && ch <= hi )); then n=$((n+1)); (( rssi > strongest )) && strongest=$rssi; fi
+    done <<< "$SCAN"
+    local here=""
+    # our own network shows up in the scan too; count only the others in our block
+    if (( curch >= lo && curch <= hi )); then here="  ← you are here"; curblock=$b; (( n > 0 )) && n=$((n-1)); curn=$n; fi
+    local dfs=""; (( lo >= 52 && lo <= 144 )) && dfs=" DFS"
+    if (( n == 0 )); then printf "  %-9s%-4s no other networks%s\n" "$b" "$dfs" "$here"
+    else printf "  %-9s%-4s %d other network(s), strongest %d dBm%s\n" "$b" "$dfs" "$n" "$strongest" "$here"; fi
+    # prefer empty non-DFS, then empty DFS, then fewest networks; ties keep the current block
+    local score=$(( n * 10 + ( ${#dfs} > 0 ? 1 : 0 ) ))
+    if (( score < bestn )) || { (( score == bestn )) && [[ "$b" == "$curblock" ]]; }; then bestn=$score; best=$b; fi
+  done
+  echo
+  if [[ "$best" == "$curblock" ]] || (( curn == 0 )); then
+    print -- "  You are already on a quiet block ($curblock): no other networks share it."
+  elif [[ -n "$best" ]]; then
+    print -- "  Quietest block from here: $best. Set the router's 5 GHz channel to ${best%-*} if it offers it;"
+    print -- "  routers often skip 36–48 or 116–128, so take the next quietest block above."
+    dim "  DFS blocks pause for about a minute after a change while the router listens for radar."
+  fi
+
+  # 2.4 GHz
+  local n1=0 n6=0 n11=0 nother=0
+  while IFS=$'\t' read -r ch w band rest; do
+    [[ "$band" != "2.4" ]] && continue
+    case $ch in 1) n1=$((n1+1));; 6) n6=$((n6+1));; 11) n11=$((n11+1));; *) nother=$((nother+1));; esac
+  done <<< "$SCAN"
+  echo; bold "  2.4 GHz"; print -- "  ch 1: $n1 · ch 6: $n6 · ch 11: $n11 · other: $nother"
+}
+
+# ---------- dispatch ---------------------------------------------------------
+
+case "${1:-}" in
+  check) cmd_check ;;
+  scan)  cmd_scan ;;
+  *)
+    cat <<EOF
+net — says in plain words why the Mac's internet is failing
+
+  net check   diagnose the current connection and give a verdict
+  net scan    nearby Wi-Fi networks and which channel block is quietest
+
+Diagnosis never needs sudo.
+EOF
+    ;;
+esac

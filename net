@@ -20,6 +20,20 @@ need_helper() {
   fi
 }
 
+# helper MODE -> prints the helper's output.
+# macOS reveals network names only to a process launched as a real app session, so the
+# helper is started with `open` and hands its result back through a temp file. If that
+# fails for any reason, fall back to running the binary directly (names hidden).
+helper() {
+  local out; out=$(mktemp -t net-doctor) || return 1
+  if open -n -g -j -W "$HERE/net-doctor.app" --args "$1" --out "$out" 2>/dev/null && [[ -s "$out" ]]; then
+    cat "$out"
+  else
+    "$WIFIINFO" "$1"
+  fi
+  rm -f "$out"
+}
+
 # ---------- shared probes ----------------------------------------------------
 
 # ping_stats HOST COUNT -> sets PLOSS (percent) and PAVG (ms, or "-")
@@ -78,7 +92,7 @@ cmd_check() {
   if [[ "$IF" == "$WIFI_IF" ]]; then
     ON_WIFI=1
     local kv; typeset -A W_INFO
-    while IFS='=' read -r k v; do W_INFO[$k]="$v"; done < <("$WIFIINFO" info)
+    while IFS='=' read -r k v; do W_INFO[$k]="$v"; done < <(helper info)
     RSSI=${W_INFO[rssi]:-0}; NOISE=${W_INFO[noise]:-0}; CH=${W_INFO[channel]:-0}
     W=${W_INFO[width]:-0}; BAND=${W_INFO[band]:-}; TX=${W_INFO[txrate]:-0}
 
@@ -175,20 +189,23 @@ cmd_scan() {
   need_helper
   bold "net scan  $(date '+%H:%M:%S')"
   print -u2 "  scanning…\c"
-  local SCAN; SCAN=$("$WIFIINFO" scan)
+  local SCAN; SCAN=$(helper scan)
   print -u2 -n "\r\e[2K"
 
-  typeset -A CUR; while IFS='=' read -r k v; do CUR[$k]="$v"; done < <("$WIFIINFO" info)
+  typeset -A CUR; while IFS='=' read -r k v; do CUR[$k]="$v"; done < <(helper info)
   local curch=${CUR[channel]:-0}
   echo
   printf "  %-4s %-6s %-5s %-9s %s\n" ch width band signal name
-  local hidden=0
+  # If no network at all has a name, macOS is withholding them; if only some are blank,
+  # those networks simply do not broadcast a name.
+  local named; named=$(print -r -- "$SCAN" | grep -cv $'\t$')
+  local blank="(hidden network)"; (( named == 0 )) && blank="(name withheld)"
   print -r -- "$SCAN" | while IFS=$'\t' read -r ch w band rssi bssid ssid; do
     local mark=" "; [[ "$ch" == "$curch" && "$curch" != 0 ]] && mark="*"
-    [[ -z "$ssid" ]] && { ssid="(name hidden)"; hidden=1; }
+    [[ -z "$ssid" ]] && ssid="$blank"
     printf " %s%-4s %-6s %-5s %-9s %s\n" "$mark" "$ch" "${w}MHz" "$band" "${rssi} dBm" "$ssid"
   done
-  print -r -- "$SCAN" | grep -q $'\t$' && dim "  Names are hidden: run \`net auth\` once, or turn on net-doctor in System Settings › Privacy & Security › Location Services."
+  (( named == 0 )) && dim "  Names withheld by macOS: run \`net auth\` once, or turn on net-doctor in System Settings › Privacy & Security › Location Services."
   [[ "$curch" != 0 ]] && dim "  * = the channel this Mac is on (ch $curch)"
 
   # 5 GHz occupancy by 80 MHz block
@@ -234,8 +251,8 @@ cmd_scan() {
 cmd_auth() {
   need_helper
   echo "Asking macOS for Location Services access so network names show in \`net scan\`."
-  echo "A dialog should appear for your terminal app. Click Allow."
-  local r; r=$("$WIFIINFO" auth)
+  echo "A dialog should appear for net-doctor. Click Allow."
+  local r; r=$(helper auth)
   case "${r#status=}" in
     granted) echo "Granted. Network names will now appear." ;;
     denied)  echo "Denied. To change it: System Settings › Privacy & Security › Location Services, turn on your terminal app." ;;

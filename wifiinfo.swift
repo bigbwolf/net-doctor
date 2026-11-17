@@ -1,11 +1,42 @@
-// wifiinfo — tiny CoreWLAN helper for `net`.
-//   wifiinfo info   key=value lines about the current Wi-Fi link
-//   wifiinfo scan   one line per nearby network: channel width band rssi bssid ssid
-// SSIDs and BSSIDs are empty unless the calling terminal has Location Services access.
+// wifiinfo — tiny CoreWLAN helper for `net`, built into net-doctor.app.
+//   wifiinfo info [--out FILE]   key=value lines about the current Wi-Fi link
+//   wifiinfo scan [--out FILE]   one line per nearby network: channel width band rssi bssid ssid
+//   wifiinfo auth [--out FILE]   request Location Services (needed for network names)
+//
+// macOS only reveals SSIDs/BSSIDs to a process that (a) is a signed app bundle with Location
+// Services granted and (b) was launched as a real app session, not spawned by a shell. `net`
+// therefore runs this through `open -W net-doctor.app --args <cmd> --out FILE` and reads
+// FILE; run directly from a shell it still works, just with names hidden.
 
 import CoreLocation
 import CoreWLAN
 import Foundation
+
+// ---------- output: to --out FILE when given, else stdout ----------
+
+let args = CommandLine.arguments
+let cmd = args.count > 1 ? args[1] : "info"
+var outPath: String? = nil
+if let i = args.firstIndex(of: "--out"), i + 1 < args.count { outPath = args[i + 1] }
+var buffer = ""
+
+func emit(_ s: String) { buffer += s + "\n" }
+
+func finish(_ code: Int32) -> Never {
+    if let p = outPath {
+        try? buffer.write(toFile: p, atomically: true, encoding: .utf8)
+    } else {
+        FileHandle.standardOutput.write(buffer.data(using: .utf8)!)
+    }
+    exit(code)
+}
+
+func note(_ s: String) {
+    // progress for a human watching a terminal; never part of the result
+    if outPath == nil { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
+}
+
+// ---------- CoreWLAN helpers ----------
 
 func widthMHz(_ w: CWChannelWidth) -> Int {
     switch w {
@@ -52,23 +83,15 @@ func securityName(_ s: CWSecurity) -> String {
     }
 }
 
-guard let iface = CWWiFiClient.shared().interface() else {
-    print("error=no Wi-Fi interface")
-    exit(1)
-}
+// ---------- location session ----------
 
-let cmd = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "info"
-
-// CoreWLAN only reveals SSIDs/BSSIDs while the process is actively using Location
-// Services, so every command opens a location session first and waits briefly for
-// the authorization state to settle. `auth` waits long enough for the dialog.
 final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     var sawPrompt = false
     var gotFix = false
     func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
         if m.authorizationStatus == .notDetermined && !sawPrompt && cmd == "auth" {
             sawPrompt = true
-            FileHandle.standardError.write("waiting for the Location Services dialog…\n".data(using: .utf8)!)
+            note("waiting for the Location Services dialog…")
         }
     }
     func locationManager(_ m: CLLocationManager, didUpdateLocations l: [CLLocation]) { gotFix = true }
@@ -78,6 +101,8 @@ let locationDelegate = LocationDelegate()
 let location = CLLocationManager()
 location.delegate = locationDelegate
 
+/// Open a location session and wait for authorization to settle (and, when authorized,
+/// for a first fix) so CoreWLAN treats this process as actively using location.
 func startLocation(waitUpTo seconds: TimeInterval) -> CLAuthorizationStatus {
     location.requestWhenInUseAuthorization()
     location.startUpdatingLocation()   // the dialog often appears only on a real request
@@ -86,39 +111,48 @@ func startLocation(waitUpTo seconds: TimeInterval) -> CLAuthorizationStatus {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
         if location.authorizationStatus != .notDetermined { break }
     }
-    // CoreWLAN treats the process as "using location" once a fix has arrived.
-    let fixDeadline = Date(timeIntervalSinceNow: 3)
-    while !locationDelegate.gotFix && Date() < fixDeadline {
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+    if location.authorizationStatus == .authorizedAlways || location.authorizationStatus == .authorized {
+        let fixDeadline = Date(timeIntervalSinceNow: 3)
+        while !locationDelegate.gotFix && Date() < fixDeadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+        }
     }
     return location.authorizationStatus
+}
+
+// ---------- commands ----------
+
+guard let iface = CWWiFiClient.shared().interface() else {
+    emit("error=no Wi-Fi interface")
+    finish(1)
 }
 
 switch cmd {
 case "info":
     _ = startLocation(waitUpTo: 2)
-    print("iface=\(iface.interfaceName ?? "")")
-    print("power=\(iface.powerOn() ? 1 : 0)")
-    print("ssid=\(iface.ssid() ?? "")")
-    print("bssid=\(iface.bssid() ?? "")")
+    emit("iface=\(iface.interfaceName ?? "")")
+    emit("power=\(iface.powerOn() ? 1 : 0)")
+    emit("ssid=\(iface.ssid() ?? "")")
+    emit("bssid=\(iface.bssid() ?? "")")
     if let ch = iface.wlanChannel() {
-        print("channel=\(ch.channelNumber)")
-        print("width=\(widthMHz(ch.channelWidth))")
-        print("band=\(bandName(ch.channelBand))")
+        emit("channel=\(ch.channelNumber)")
+        emit("width=\(widthMHz(ch.channelWidth))")
+        emit("band=\(bandName(ch.channelBand))")
     } else {
-        print("channel=0")
-        print("width=0")
-        print("band=")
+        emit("channel=0")
+        emit("width=0")
+        emit("band=")
     }
-    print("rssi=\(iface.rssiValue())")
-    print("noise=\(iface.noiseMeasurement())")
-    print("txrate=\(Int(iface.transmitRate()))")
-    print("phy=\(phyName(iface.activePHYMode()))")
-    print("security=\(securityName(iface.security()))")
+    emit("rssi=\(iface.rssiValue())")
+    emit("noise=\(iface.noiseMeasurement())")
+    emit("txrate=\(Int(iface.transmitRate()))")
+    emit("phy=\(phyName(iface.activePHYMode()))")
+    emit("security=\(securityName(iface.security()))")
+    finish(0)
 
 case "scan":
     _ = startLocation(waitUpTo: 2)
-    // Two passes catch networks a single scan misses. Keyed by BSSID when we can see it,
+    // Two passes catch networks a single scan misses. Keyed by BSSID when visible,
     // otherwise by channel+rssi so the same hidden network does not show twice.
     var seen: [String: CWNetwork] = [:]
     for _ in 0..<2 {
@@ -135,23 +169,25 @@ case "scan":
     }
     for n in sorted {
         let ch = n.wlanChannel
-        print("\(ch?.channelNumber ?? 0)\t\(widthMHz(ch?.channelWidth ?? .widthUnknown))\t\(bandName(ch?.channelBand ?? .bandUnknown))\t\(n.rssiValue)\t\(n.bssid ?? "")\t\(n.ssid ?? "")")
+        emit("\(ch?.channelNumber ?? 0)\t\(widthMHz(ch?.channelWidth ?? .widthUnknown))\t\(bandName(ch?.channelBand ?? .bandUnknown))\t\(n.rssiValue)\t\(n.bssid ?? "")\t\(n.ssid ?? "")")
     }
+    finish(0)
 
 case "auth":
     if !CLLocationManager.locationServicesEnabled() {
-        print("status=services-off")
-        exit(1)
+        emit("status=services-off")
+        finish(1)
     }
     switch startLocation(waitUpTo: 120) {
-    case .authorizedAlways, .authorized: print("status=granted")
-    case .denied: print("status=denied")
-    case .restricted: print("status=restricted")
-    case .notDetermined: print("status=timeout"); exit(1)
-    @unknown default: print("status=unknown")
+    case .authorizedAlways, .authorized: emit("status=granted")
+    case .denied: emit("status=denied")
+    case .restricted: emit("status=restricted")
+    case .notDetermined: emit("status=timeout"); finish(1)
+    @unknown default: emit("status=unknown")
     }
+    finish(0)
 
 default:
-    print("usage: wifiinfo [info|scan|auth]")
-    exit(2)
+    emit("usage: wifiinfo [info|scan|auth] [--out FILE]")
+    finish(2)
 }

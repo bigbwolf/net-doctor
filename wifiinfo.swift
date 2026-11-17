@@ -107,7 +107,9 @@ case "auth":
     final class Delegate: NSObject, CLLocationManagerDelegate {
         func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
             switch m.authorizationStatus {
-            case .notDetermined: return            // prompt is up; keep waiting
+            case .notDetermined:
+                FileHandle.standardError.write("waiting for the Location Services dialog…\n".data(using: .utf8)!)
+                return
             case .authorizedAlways, .authorized: print("status=granted")
             case .denied: print("status=denied")
             case .restricted: print("status=restricted")
@@ -115,11 +117,21 @@ case "auth":
             }
             exit(0)
         }
+        func locationManager(_ m: CLLocationManager, didUpdateLocations l: [CLLocation]) {}
+        func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
+            FileHandle.standardError.write("location error: \(e.localizedDescription)\n".data(using: .utf8)!)
+        }
+    }
+    if !CLLocationManager.locationServicesEnabled() {
+        print("status=services-off")
+        exit(1)
     }
     let manager = CLLocationManager()
     let delegate = Delegate()
     manager.delegate = delegate
     manager.requestWhenInUseAuthorization()
+    // On macOS the dialog is often only shown once a real location request is made.
+    manager.startUpdatingLocation()
     RunLoop.main.run(until: Date(timeIntervalSinceNow: 120))
     print("status=timeout")
     exit(1)

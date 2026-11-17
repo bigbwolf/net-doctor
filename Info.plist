@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.bigbwolf.net-doctor.wifiinfo</string>
+	<key>CFBundleName</key>
+	<string>wifiinfo</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSLocationUsageDescription</key>
+	<string>net-doctor needs Location Services so macOS will reveal the names of nearby Wi-Fi networks in scans.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>net-doctor needs Location Services so macOS will reveal the names of nearby Wi-Fi networks in scans.</string>
+</dict>
+</plist>

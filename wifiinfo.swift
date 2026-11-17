@@ -59,8 +59,44 @@ guard let iface = CWWiFiClient.shared().interface() else {
 
 let cmd = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "info"
 
+// CoreWLAN only reveals SSIDs/BSSIDs while the process is actively using Location
+// Services, so every command opens a location session first and waits briefly for
+// the authorization state to settle. `auth` waits long enough for the dialog.
+final class LocationDelegate: NSObject, CLLocationManagerDelegate {
+    var sawPrompt = false
+    var gotFix = false
+    func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+        if m.authorizationStatus == .notDetermined && !sawPrompt && cmd == "auth" {
+            sawPrompt = true
+            FileHandle.standardError.write("waiting for the Location Services dialog…\n".data(using: .utf8)!)
+        }
+    }
+    func locationManager(_ m: CLLocationManager, didUpdateLocations l: [CLLocation]) { gotFix = true }
+    func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {}
+}
+let locationDelegate = LocationDelegate()
+let location = CLLocationManager()
+location.delegate = locationDelegate
+
+func startLocation(waitUpTo seconds: TimeInterval) -> CLAuthorizationStatus {
+    location.requestWhenInUseAuthorization()
+    location.startUpdatingLocation()   // the dialog often appears only on a real request
+    let deadline = Date(timeIntervalSinceNow: seconds)
+    while Date() < deadline {
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+        if location.authorizationStatus != .notDetermined { break }
+    }
+    // CoreWLAN treats the process as "using location" once a fix has arrived.
+    let fixDeadline = Date(timeIntervalSinceNow: 3)
+    while !locationDelegate.gotFix && Date() < fixDeadline {
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+    }
+    return location.authorizationStatus
+}
+
 switch cmd {
 case "info":
+    _ = startLocation(waitUpTo: 2)
     print("iface=\(iface.interfaceName ?? "")")
     print("power=\(iface.powerOn() ? 1 : 0)")
     print("ssid=\(iface.ssid() ?? "")")
@@ -81,6 +117,7 @@ case "info":
     print("security=\(securityName(iface.security()))")
 
 case "scan":
+    _ = startLocation(waitUpTo: 2)
     // Two passes catch networks a single scan misses. Keyed by BSSID when we can see it,
     // otherwise by channel+rssi so the same hidden network does not show twice.
     var seen: [String: CWNetwork] = [:]
@@ -102,39 +139,17 @@ case "scan":
     }
 
 case "auth":
-    // Ask for Location Services so CoreWLAN will show network names. macOS attributes
-    // the request to the terminal app running us, which is what the user grants.
-    final class Delegate: NSObject, CLLocationManagerDelegate {
-        func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
-            switch m.authorizationStatus {
-            case .notDetermined:
-                FileHandle.standardError.write("waiting for the Location Services dialog…\n".data(using: .utf8)!)
-                return
-            case .authorizedAlways, .authorized: print("status=granted")
-            case .denied: print("status=denied")
-            case .restricted: print("status=restricted")
-            @unknown default: print("status=unknown")
-            }
-            exit(0)
-        }
-        func locationManager(_ m: CLLocationManager, didUpdateLocations l: [CLLocation]) {}
-        func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
-            FileHandle.standardError.write("location error: \(e.localizedDescription)\n".data(using: .utf8)!)
-        }
-    }
     if !CLLocationManager.locationServicesEnabled() {
         print("status=services-off")
         exit(1)
     }
-    let manager = CLLocationManager()
-    let delegate = Delegate()
-    manager.delegate = delegate
-    manager.requestWhenInUseAuthorization()
-    // On macOS the dialog is often only shown once a real location request is made.
-    manager.startUpdatingLocation()
-    RunLoop.main.run(until: Date(timeIntervalSinceNow: 120))
-    print("status=timeout")
-    exit(1)
+    switch startLocation(waitUpTo: 120) {
+    case .authorizedAlways, .authorized: print("status=granted")
+    case .denied: print("status=denied")
+    case .restricted: print("status=restricted")
+    case .notDetermined: print("status=timeout"); exit(1)
+    @unknown default: print("status=unknown")
+    }
 
 default:
     print("usage: wifiinfo [info|scan|auth]")

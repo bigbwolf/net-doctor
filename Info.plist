@@ -5,9 +5,19 @@
 	<key>CFBundleIdentifier</key>
 	<string>com.bigbwolf.net-doctor.wifiinfo</string>
 	<key>CFBundleName</key>
+	<string>net-doctor</string>
+	<key>CFBundleExecutable</key>
 	<string>wifiinfo</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSLocationUsageDescription</key>
 	<string>net-doctor needs Location Services so macOS will reveal the names of nearby Wi-Fi networks in scans.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

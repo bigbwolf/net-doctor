@@ -6,7 +6,7 @@
 
 set -u
 HERE="${0:A:h}"
-WIFIINFO="$HERE/wifiinfo"
+WIFIINFO="$HERE/net-doctor.app/Contents/MacOS/wifiinfo"
 LOG=/usr/bin/log          # zsh has a builtin named `log`
 
 bold() { print -P "%B$*%b"; }

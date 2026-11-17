@@ -62,7 +62,7 @@ make install        # builds the helper, symlinks `net` into ~/.local/bin
 
 - `net` is a zsh script. It uses `route`, `ipconfig`, `ping`, `dig`, `curl`, `scutil` and
   `log show`, all of which ship with macOS.
-- `wifiinfo` is a 100-line Swift helper around CoreWLAN for the readings the shell cannot
+- `wifiinfo` is a small Swift helper around CoreWLAN, built into a minimal `net-doctor.app` bundle because macOS only shows the Location Services prompt to bundled apps. It is used for the readings the shell cannot
   get: RSSI, noise, channel, width, transmit rate, and the scan.
 - Driver stall counters (`DPS Symptoms`, `Datapath timeout`, channel-busy %) come from the
   kernel's unified log; reading 10 minutes of it takes a few seconds.

@@ -188,7 +188,7 @@ cmd_scan() {
     [[ -z "$ssid" ]] && { ssid="(name hidden)"; hidden=1; }
     printf " %s%-4s %-6s %-5s %-9s %s\n" "$mark" "$ch" "${w}MHz" "$band" "${rssi} dBm" "$ssid"
   done
-  print -r -- "$SCAN" | grep -q $'\t$' && dim "  Names are hidden: run `net auth` once, or turn on net-doctor in System Settings › Privacy & Security › Location Services."
+  print -r -- "$SCAN" | grep -q $'\t$' && dim "  Names are hidden: run \`net auth\` once, or turn on net-doctor in System Settings › Privacy & Security › Location Services."
   [[ "$curch" != 0 ]] && dim "  * = the channel this Mac is on (ch $curch)"
 
   # 5 GHz occupancy by 80 MHz block

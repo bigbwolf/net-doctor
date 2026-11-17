@@ -248,7 +248,62 @@ cmd_scan() {
 
 # ---------- devices ----------------------------------------------------------
 
+# probe_device IP MAC -> what one LAN device reveals without credentials
+probe_device() {
+  local ip=$1 mac=${2:-}
+  bold "net devices $ip  $(date '+%H:%M:%S')"
+  local name; name=$(dig @224.0.0.251 -p 5353 -x "$ip" +short +time=1 +tries=2 2>/dev/null | head -1); name=${name%.}
+  [[ -z "$mac" ]] && { ping -c 1 -W 500 -t 1 -q "$ip" >/dev/null 2>&1; mac=$(arp -an | awk -v ip="($ip)" '$2==ip{print $4}'); }
+  row "address" "$ip"
+  [[ -n "$mac" ]] && {
+    # second hex digit with bit 1 set = locally administered = randomized/private address
+    local b2=${mac%%:*}; b2=${(L)b2}; [[ ${#b2} == 1 ]] && b2="0$b2"
+    local priv=""; [[ "${b2:1:1}" == [26ae] ]] && priv=" (private/randomized address, vendor not identifiable)"
+    row "mac" "$mac$priv"
+  }
+  row "mDNS name" "${name:--}"
+  # Apple devices publish their model over mDNS
+  if [[ -n "$name" ]]; then
+    local model; model=$(dig @224.0.0.251 -p 5353 "${name%.local}._device-info._tcp.local" TXT +short +time=1 +tries=1 2>/dev/null | tr -d '"' | grep -o 'model=[^ ]*\|osxvers=[0-9]*' | tr '\n' ' ')
+    [[ -n "$model" ]] && row "device-info" "$model"
+  fi
+  # quick look at common TCP ports (1 s each, all at once)
+  local -A pnames; pnames=(22 ssh 53 dns 80 http 443 https 445 smb 548 afp 554 rtsp-camera 1883 mqtt 3389 rdp 5000 upnp/synology 5353 mdns 7000 airplay 8008 chromecast 8009 chromecast 8080 http-alt 8443 https-alt 9100 printer 32400 plex 49152 upnp 62078 iphone-sync)
+  local open=() port tmp; tmp=$(mktemp -t net-doctor)
+  for port in ${(k)pnames}; do ( nc -z -G 1 -w 1 "$ip" "$port" >/dev/null 2>&1 && print "$port" >> "$tmp" ) & done
+  wait
+  for port in $(sort -n "$tmp" 2>/dev/null); do open+=("$port/${pnames[$port]}"); done
+  rm -f "$tmp"
+  row "open ports" "${open:--none of the common ones}"
+  # web server banner, if any
+  local scheme hdr title
+  for port in 80 443 8080; do
+    (( ${open[(I)$port/*]} )) || continue
+    scheme=http; [[ $port == 443 ]] && scheme=https
+    hdr=$(curl -sk -m 3 -o /dev/null -w '%{http_code} %{redirect_url}' -D - "$scheme://$ip:$port/" 2>/dev/null | awk 'tolower($1)=="server:"{sub(/^[^ ]+ /,""); s=$0} END{print s}' | tr -d '\r')
+    title=$(curl -skL -m 3 "$scheme://$ip:$port/" 2>/dev/null | grep -o -i '<title>[^<]*' | head -1 | sed 's/<title>//I')
+    [[ -n "$hdr$title" ]] && row "$scheme:$port" "${hdr:+server: $hdr }${title:+title: $title}"
+  done
+  # a guess at what it is, from the cheapest signals
+  local guess=""
+  if   (( ${open[(I)62078/*]} )); then guess="iPhone or iPad (port 62078 is Apple's device-sync service)"
+  elif (( ${open[(I)7000/*]} )) && (( ${open[(I)5000/*]} )); then guess="Apple TV, HomePod or a Mac with AirPlay Receiver on"
+  elif (( ${open[(I)8009/*]} )); then guess="Chromecast, Google TV or Android TV"
+  elif (( ${open[(I)9100/*]} )); then guess="network printer"
+  elif (( ${open[(I)554/*]} )); then guess="IP camera or NVR"
+  elif (( ${open[(I)32400/*]} )); then guess="Plex server"
+  elif (( ${open[(I)1883/*]} )); then guess="MQTT broker / smart-home hub"
+  elif [[ "$ip" == "$(ipconfig getoption "$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')" router 2>/dev/null)" ]]; then guess="the router"
+  elif (( ${open[(I)445/*]} )) || (( ${open[(I)3389/*]} )); then guess="Windows PC or NAS"
+  elif (( ${open[(I)548/*]} )) || (( ${open[(I)22/*]} )); then guess="Mac, Linux box or NAS"
+  elif [[ "$name" == *-MacBook* || "$name" == *-iMac* || "$name" == *-Mac-* ]]; then guess="Mac (from its name)"
+  fi
+  [[ -n "$guess" ]] && row "looks like" "$guess"
+  dim "  Everything above is what the device offers to anyone on the network; nothing was logged into."
+}
+
 cmd_devices() {
+  if [[ -n "${1:-}" ]]; then probe_device "$1"; return; fi
   local IF IP GW MASK
   IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
   [[ -z "$IF" ]] && { echo "Not connected to any network."; return 1; }
@@ -290,6 +345,17 @@ cmd_devices() {
 cmd_bt() {
   need_helper
   if [[ -n "${1:-}" ]]; then
+    if [[ "${2:-}" == "--probe" ]]; then
+      # connect and read the public services; vendor services are listed, not read
+      bold "net bt $1 --probe  $(date '+%H:%M:%S')"
+      dim "  Connecting to a device you do not own: it is a read of public information and changes nothing,"
+      dim "  but the owner's app may log a connection. Use on devices you are responsible for."
+      print -u2 -n "  listening and connecting (up to 25 s)…"
+      local R; R=$(helper btprobe "$1")
+      print -u2 -n "\r\e[2K"
+      print -r -- "$R" | sed 's/^/  /'
+      return
+    fi
     # net bt <name or id fragment>: every field that device advertises
     bold "net bt $1  $(date '+%H:%M:%S')"
     print -u2 -n "  listening (6 s)…"
@@ -297,6 +363,7 @@ cmd_bt() {
     print -u2 -n "\r\e[2K"
     [[ -z "$R" ]] && { echo "  No device matching '$1' heard. Names are case-insensitive; an id is the 8-character code from \`net bt\`."; return 1; }
     print -r -- "$R" | sed 's/^/  /'
+    dim "  Add --probe to connect and read its public device information."
     return
   fi
   bold "net bt  $(date '+%H:%M:%S')"
@@ -340,8 +407,8 @@ cmd_auth() {
 case "${1:-}" in
   check) cmd_check ;;
   scan)  cmd_scan ;;
-  devices) cmd_devices ;;
-  bt)    cmd_bt "${2:-}" ;;
+  devices) cmd_devices "${2:-}" ;;
+  bt)    cmd_bt "${2:-}" "${3:-}" ;;
   auth)  cmd_auth ;;
   *)
     cat <<EOF
@@ -349,7 +416,7 @@ net — says in plain words why the Mac's internet is failing
 
   net check   diagnose the current connection and give a verdict
   net scan    nearby Wi-Fi networks and which channel block is quietest
-  net devices every device on the network you are connected to
+  net devices every device on the network you are connected to; `net devices <ip>` probes one
   net bt      every Bluetooth device within reach; `net bt <name>` shows everything one device advertises
   net auth    one-time: allow Location Services so scan shows network names
 

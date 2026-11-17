@@ -32,10 +32,12 @@ Verdict:
 | `net check` | Diagnose the current connection: radio quality, driver stalls in the last 10 minutes, then router → internet → DNS → HTTPS probes, then a verdict |
 | `net scan` | Nearby Wi-Fi networks with channel, width and signal; which 5 GHz channel block is quietest from where you sit |
 | `net devices` | Every device on the network you are on: address, MAC and name (via a ping sweep, ARP and mDNS) |
+| `net devices <ip>` | What one device reveals without credentials: mDNS name, Apple model, open common ports, web banner, and a guess at what it is |
 | `net bt` | Every Bluetooth LE device within reach: signal, vendor, what kind of device it says it is, name if it sends one |
+| `net bt <name>` | Every field one device advertises; add `--probe` to connect and read its public Device Information service |
 | `net auth` | One-time: ask macOS for Location Services so `scan` can show network names |
 
-Diagnosis never needs `sudo`.
+Diagnosis never needs `sudo`. The probes (`net devices <ip>`, `net bt <name> --probe`) read only what a device offers to anyone nearby and log into nothing; still, use them on networks and devices you are responsible for.
 
 ## The verdicts
 

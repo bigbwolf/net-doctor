@@ -20,6 +20,8 @@
 	<true/>
 	<key>NSLocationUsageDescription</key>
 	<string>net-doctor needs Location Services so macOS will reveal the names of nearby Wi-Fi networks in scans.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>net-doctor scans for nearby Bluetooth devices when you run `net bt`.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>net-doctor needs Location Services so macOS will reveal the names of nearby Wi-Fi networks in scans.</string>
 </dict>

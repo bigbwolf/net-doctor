@@ -2,12 +2,14 @@
 //   wifiinfo info [--out FILE]   key=value lines about the current Wi-Fi link
 //   wifiinfo scan [--out FILE]   one line per nearby network: channel width band rssi bssid ssid
 //   wifiinfo auth [--out FILE]   request Location Services (needed for network names)
+//   wifiinfo bt   [--out FILE]   nearby Bluetooth LE devices: rssi vendor kind name id
 //
 // macOS only reveals SSIDs/BSSIDs to a process that (a) is a signed app bundle with Location
 // Services granted and (b) was launched as a real app session, not spawned by a shell. `net`
 // therefore runs this through `open -W net-doctor.app --args <cmd> --out FILE` and reads
 // FILE; run directly from a shell it still works, just with names hidden.
 
+import CoreBluetooth
 import CoreLocation
 import CoreWLAN
 import Foundation
@@ -187,7 +189,78 @@ case "auth":
     }
     finish(0)
 
+case "bt":
+    // Listen to BLE advertisements for a few seconds. Addresses are randomized by most
+    // devices, so the id is only stable within one scan.
+    final class BT: NSObject, CBCentralManagerDelegate {
+        struct Seen { var name: String?; var rssi: Int; var mfg: Data?; var services: [CBUUID]; var hits: Int }
+        var found: [UUID: Seen] = [:]
+        var unauthorized = false, off = false, unsupported = false
+        func centralManagerDidUpdateState(_ c: CBCentralManager) {
+            switch c.state {
+            case .poweredOn:
+                c.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            case .unauthorized: unauthorized = true
+            case .poweredOff: off = true
+            case .unsupported: unsupported = true
+            default: break
+            }
+        }
+        func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral, advertisementData ad: [String: Any], rssi: NSNumber) {
+            var e = found[p.identifier] ?? Seen(name: nil, rssi: -200, mfg: nil, services: [], hits: 0)
+            if let n = ad[CBAdvertisementDataLocalNameKey] as? String, !n.isEmpty { e.name = n } else if e.name == nil { e.name = p.name }
+            if rssi.intValue < 0 { e.rssi = max(e.rssi, rssi.intValue) }
+            if let m = ad[CBAdvertisementDataManufacturerDataKey] as? Data, m.count >= 2 { e.mfg = m }
+            if let s = ad[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] { e.services = s }
+            e.hits += 1
+            found[p.identifier] = e
+        }
+    }
+    let vendors: [UInt16: String] = [
+        0x004C: "Apple", 0x0006: "Microsoft", 0x0075: "Samsung", 0x00E0: "Google", 0x0087: "Garmin",
+        0x038F: "Xiaomi", 0x0157: "Amazfit", 0x0171: "Amazon", 0x012D: "Sony", 0x0117: "Bose",
+        0x00C4: "LG", 0x01DA: "Logitech", 0x0002: "Intel", 0x0059: "Nordic", 0x0046: "MediaTek",
+        0x01D7: "Qualcomm", 0x0310: "Fitbit", 0x0D0D: "Oura", 0x0822: "Tile", 0x05A7: "Sonos", 0x07D0: "Tuya (smart home)",
+    ]
+    let appleKinds: [UInt8: String] = [
+        0x02: "iBeacon", 0x05: "AirDrop", 0x07: "AirPods/Beats", 0x09: "AirPlay target", 0x0a: "AirPlay source",
+        0x0c: "Handoff", 0x0e: "Personal Hotspot", 0x0f: "Nearby action", 0x10: "iPhone/iPad/Mac/Watch",
+        0x12: "Find My (AirTag or device)", 0x13: "Find My",
+    ]
+    let serviceKinds: [String: String] = [
+        "FE2C": "Google Fast Pair", "FEED": "Tile tracker", "FD6F": "Exposure notification", "FEAA": "Eddystone beacon",
+        "180D": "Heart-rate sensor", "1812": "Keyboard/mouse", "FD5A": "Samsung SmartTag", "FEF3": "Google",
+        "FE9F": "Google", "FDF0": "Samsung Galaxy Buds", "FE07": "Sonos", "FEF5": "Dialog Semi", "FE0F": "Philips Hue",
+    ]
+    let d = BT()
+    let central = CBCentralManager(delegate: d, queue: nil)
+    _ = central
+    let deadline = Date(timeIntervalSinceNow: 6)
+    while Date() < deadline {
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+        if d.unauthorized || d.off || d.unsupported { break }
+    }
+    if d.unauthorized { emit("error=bluetooth-unauthorized"); finish(1) }
+    if d.off { emit("error=bluetooth-off"); finish(1) }
+    if d.unsupported { emit("error=bluetooth-unsupported"); finish(1) }
+    for (id, e) in d.found.sorted(by: { $0.value.rssi > $1.value.rssi }) {
+        var vendor = "", kind = ""
+        if let m = e.mfg {
+            let company = UInt16(m[m.startIndex]) | (UInt16(m[m.startIndex + 1]) << 8)
+            vendor = vendors[company] ?? String(format: "vendor 0x%04X", company)
+            if company == 0x004C, m.count >= 3 { kind = appleKinds[m[m.startIndex + 2]] ?? "Apple device" }
+        }
+        if kind.isEmpty {
+            for s in e.services { if let k = serviceKinds[s.uuidString] { kind = k; break } }
+        }
+        if vendor.isEmpty, !e.services.isEmpty, kind.isEmpty { kind = "services " + e.services.map { $0.uuidString }.prefix(2).joined(separator: ",") }
+        // unit separator rather than tab: zsh collapses empty tab fields
+        let name = (e.name ?? "").trimmingCharacters(in: .whitespaces)
+        emit([String(e.rssi), vendor, kind, name, String(id.uuidString.prefix(8)), String(e.hits)].joined(separator: "\u{1F}"))
+    }
+    finish(0)
+
 default:
-    emit("usage: wifiinfo [info|scan|auth] [--out FILE]")
+    emit("usage: wifiinfo [info|scan|auth|bt] [--out FILE]")
     finish(2)
 }

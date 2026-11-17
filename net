@@ -285,6 +285,33 @@ cmd_devices() {
   dim "  Apple devices rotate their MAC addresses per network, so the same phone can look different on each Wi-Fi."
 }
 
+# ---------- bt --------------------------------------------------------------
+
+cmd_bt() {
+  need_helper
+  bold "net bt  $(date '+%H:%M:%S')"
+  print -u2 -n "  listening for Bluetooth advertisements (6 s)…"
+  local BT; BT=$(helper bt)
+  print -u2 -n "\r\e[2K"
+  case "$BT" in
+    error=bluetooth-unauthorized) echo "  Bluetooth access denied. System Settings › Privacy & Security › Bluetooth, turn on net-doctor."; return 1 ;;
+    error=bluetooth-off)          echo "  Bluetooth is turned off."; return 1 ;;
+    error=*)                      echo "  ${BT#error=}"; return 1 ;;
+  esac
+  echo
+  printf "  %-8s %-10s %-28s %s\n" signal vendor kind name
+  local rssi vendor kind name id hits n=0 near=0
+  while IFS=$'\x1f' read -r rssi vendor kind name id hits; do
+    [[ -z "$rssi" ]] && continue
+    n=$((n+1)); (( rssi >= -60 )) && near=$((near+1))
+    printf "  %-8s %-10s %-28s %s\n" "${rssi} dBm" "${vendor:--}" "${kind:--}" "$name"
+  done <<< "$BT"
+  echo
+  echo "  $n device(s) heard, $near of them within a few metres (stronger than -60 dBm)."
+  dim "  Kind is read from the advertisement: Apple devices say what they are, most others only who made them."
+  dim "  Addresses rotate every few minutes, so the same device can appear twice; names show only if the device sends one."
+}
+
 # ---------- dispatch ---------------------------------------------------------
 
 cmd_auth() {
@@ -304,6 +331,7 @@ case "${1:-}" in
   check) cmd_check ;;
   scan)  cmd_scan ;;
   devices) cmd_devices ;;
+  bt)    cmd_bt ;;
   auth)  cmd_auth ;;
   *)
     cat <<EOF
@@ -312,6 +340,7 @@ net — says in plain words why the Mac's internet is failing
   net check   diagnose the current connection and give a verdict
   net scan    nearby Wi-Fi networks and which channel block is quietest
   net devices every device on the network you are connected to
+  net bt      every Bluetooth device within reach
   net auth    one-time: allow Location Services so scan shows network names
 
 Diagnosis never needs sudo.

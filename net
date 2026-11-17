@@ -246,6 +246,45 @@ cmd_scan() {
   echo; bold "  2.4 GHz"; print -- "  ch 1: $n1 · ch 6: $n6 · ch 11: $n11 · other: $nother"
 }
 
+# ---------- devices ----------------------------------------------------------
+
+cmd_devices() {
+  local IF IP GW MASK
+  IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+  [[ -z "$IF" ]] && { echo "Not connected to any network."; return 1; }
+  IP=$(ipconfig getifaddr "$IF"); GW=$(ipconfig getoption "$IF" router); MASK=$(ipconfig getoption "$IF" subnet_mask)
+  bold "net devices  $(date '+%H:%M:%S')"
+  echo "  network ${IP%.*}.0/24 via $IF (router ${GW:--})"
+  [[ "$MASK" != "255.255.255.0" && -n "$MASK" ]] && dim "  subnet mask is $MASK; only the /24 around this Mac is swept"
+  print -u2 -n "  sweeping 254 addresses…"
+  # one ping per address, all at once; replies land in the ARP table whether or not
+  # the device answers ping (the ARP exchange alone is enough)
+  local i; for i in {1..254}; do ping -c 1 -W 500 -t 1 -q "${IP%.*}.$i" >/dev/null 2>&1 & done; wait
+  print -u2 -n "\r\e[2K"
+  echo
+  printf "  %-16s %-18s %s\n" address mac name
+  local n=0 line ip mac name
+  # arp -an is instant; names come from a one-shot mDNS reverse query per device, which
+  # Apple and most modern devices answer with their own name
+  arp -an -i "$IF" 2>/dev/null | grep -v incomplete | sort -t. -k4 -n | while read -r line; do
+    ip=${${line#*\(}%%\)*}; mac=$(print -r -- "$line" | awk '{print $4}')
+    [[ "$ip" == *.255 || "$mac" == ff:ff:ff:ff:ff:ff || "$ip" == "$IP" ]] && continue
+    [[ "$ip" != "${IP%.*}".* ]] && continue
+    name=$(dig @224.0.0.251 -p 5353 -x "$ip" +short +time=1 +tries=2 2>/dev/null | head -1)
+    name=${name%.local.}
+    [[ "$ip" == "$GW" ]] && name="${name:+$name }(router)"
+    n=$((n+1))
+    printf "  %-16s %-18s %s\n" "$ip" "$mac" "$name"
+  done
+  printf "  %-16s %-18s %s\n" "$IP" "$(ifconfig "$IF" | awk '/ether/{print $2}')" "$(scutil --get LocalHostName 2>/dev/null) (this Mac)"
+  echo
+  local total; total=$(arp -an -i "$IF" 2>/dev/null | grep -v incomplete | grep -v "($IP)" | grep -c "(${IP%.*}\.[0-9]*)")
+  echo "  $total other device(s) on the network right now."
+  dim "  Devices that do not answer mDNS show no name. The router's admin page also lists clients by band;"
+  dim "  this view catches wired devices too, and anything asleep that still answers ARP."
+  dim "  Apple devices rotate their MAC addresses per network, so the same phone can look different on each Wi-Fi."
+}
+
 # ---------- dispatch ---------------------------------------------------------
 
 cmd_auth() {
@@ -264,6 +303,7 @@ cmd_auth() {
 case "${1:-}" in
   check) cmd_check ;;
   scan)  cmd_scan ;;
+  devices) cmd_devices ;;
   auth)  cmd_auth ;;
   *)
     cat <<EOF
@@ -271,6 +311,7 @@ net — says in plain words why the Mac's internet is failing
 
   net check   diagnose the current connection and give a verdict
   net scan    nearby Wi-Fi networks and which channel block is quietest
+  net devices every device on the network you are connected to
   net auth    one-time: allow Location Services so scan shows network names
 
 Diagnosis never needs sudo.

@@ -26,10 +26,10 @@ need_helper() {
 # fails for any reason, fall back to running the binary directly (names hidden).
 helper() {
   local out; out=$(mktemp -t net-doctor) || return 1
-  if open -n -g -j -W "$HERE/net-doctor.app" --args "$1" --out "$out" 2>/dev/null && [[ -s "$out" ]]; then
+  if open -n -g -j -W "$HERE/net-doctor.app" --args "$@" --out "$out" 2>/dev/null && [[ -s "$out" ]]; then
     cat "$out"
   else
-    "$WIFIINFO" "$1"
+    "$WIFIINFO" "$@"
   fi
   rm -f "$out"
 }
@@ -289,6 +289,16 @@ cmd_devices() {
 
 cmd_bt() {
   need_helper
+  if [[ -n "${1:-}" ]]; then
+    # net bt <name or id fragment>: every field that device advertises
+    bold "net bt $1  $(date '+%H:%M:%S')"
+    print -u2 -n "  listening (6 s)…"
+    local R; R=$(helper bt "$1")
+    print -u2 -n "\r\e[2K"
+    [[ -z "$R" ]] && { echo "  No device matching '$1' heard. Names are case-insensitive; an id is the 8-character code from \`net bt\`."; return 1; }
+    print -r -- "$R" | sed 's/^/  /'
+    return
+  fi
   bold "net bt  $(date '+%H:%M:%S')"
   print -u2 -n "  listening for Bluetooth advertisements (6 s)…"
   local BT; BT=$(helper bt)
@@ -331,7 +341,7 @@ case "${1:-}" in
   check) cmd_check ;;
   scan)  cmd_scan ;;
   devices) cmd_devices ;;
-  bt)    cmd_bt ;;
+  bt)    cmd_bt "${2:-}" ;;
   auth)  cmd_auth ;;
   *)
     cat <<EOF
@@ -340,7 +350,7 @@ net — says in plain words why the Mac's internet is failing
   net check   diagnose the current connection and give a verdict
   net scan    nearby Wi-Fi networks and which channel block is quietest
   net devices every device on the network you are connected to
-  net bt      every Bluetooth device within reach
+  net bt      every Bluetooth device within reach; `net bt <name>` shows everything one device advertises
   net auth    one-time: allow Location Services so scan shows network names
 
 Diagnosis never needs sudo.

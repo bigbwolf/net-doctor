@@ -193,7 +193,7 @@ case "bt":
     // Listen to BLE advertisements for a few seconds. Addresses are randomized by most
     // devices, so the id is only stable within one scan.
     final class BT: NSObject, CBCentralManagerDelegate {
-        struct Seen { var name: String?; var rssi: Int; var mfg: Data?; var services: [CBUUID]; var hits: Int }
+        struct Seen { var name: String?; var rssi: Int; var mfg: Data?; var services: [CBUUID]; var hits: Int; var raw: [String: Any] = [:] }
         var found: [UUID: Seen] = [:]
         var unauthorized = false, off = false, unsupported = false
         func centralManagerDidUpdateState(_ c: CBCentralManager) {
@@ -213,6 +213,7 @@ case "bt":
             if let m = ad[CBAdvertisementDataManufacturerDataKey] as? Data, m.count >= 2 { e.mfg = m }
             if let s = ad[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] { e.services = s }
             e.hits += 1
+            for (k, v) in ad { e.raw[k] = v }
             found[p.identifier] = e
         }
     }
@@ -243,6 +244,20 @@ case "bt":
     if d.unauthorized { emit("error=bluetooth-unauthorized"); finish(1) }
     if d.off { emit("error=bluetooth-off"); finish(1) }
     if d.unsupported { emit("error=bluetooth-unsupported"); finish(1) }
+    if args.count > 2, args[2] != "--out" {
+        // detail mode: wifiinfo bt <name-or-id-fragment> → every advertised field
+        let want = args[2].lowercased()
+        for (id, e) in d.found where (e.name ?? "").lowercased().contains(want) || id.uuidString.lowercased().hasPrefix(want) {
+            emit("device \(id.uuidString.prefix(8))  rssi \(e.rssi)  heard \(e.hits)x  name \(e.name ?? "-")")
+            for (k, v) in e.raw.sorted(by: { $0.key < $1.key }) {
+                let key = k.replacingOccurrences(of: "kCBAdvData", with: "")
+                if let dta = v as? Data { emit("  \(key): \(dta.map { String(format: "%02x", $0) }.joined(separator: " "))") }
+                else if let sd = v as? [CBUUID: Data] { for (u, dta) in sd { emit("  \(key) \(u.uuidString): \(dta.map { String(format: "%02x", $0) }.joined(separator: " "))") } }
+                else { emit("  \(key): \(v)") }
+            }
+        }
+        finish(0)
+    }
     for (id, e) in d.found.sorted(by: { $0.value.rssi > $1.value.rssi }) {
         var vendor = "", kind = ""
         if let m = e.mfg {

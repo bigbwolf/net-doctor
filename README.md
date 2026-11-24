@@ -31,7 +31,8 @@ Verdict:
 |---|---|
 | `net check` | Diagnose the current connection: radio quality, driver stalls in the last 10 minutes, then router → internet → DNS → HTTPS probes, then a verdict |
 | `net scan` | Nearby Wi-Fi networks with channel, width and signal; which 5 GHz channel block is quietest from where you sit |
-| `net devices` | Every device on the network you are on: address, MAC and name (via a ping sweep, ARP and mDNS) |
+| `net hidden` | Every hidden network in range and what its beacons still give away: distance band, maker (from the MAC), security, Wi-Fi generation, WPS maker/model/device type, and which named router it belongs to; ends with whether any is close enough to be in your home. `--follow` rescans continuously so you can walk toward one |
+| `net devices` | Every device on the network you are on: address, MAC, maker and name (via a ping sweep, ARP and mDNS) |
 | `net devices <ip>` | What one device reveals without credentials: mDNS name, Apple model, open common ports, web banner, and a guess at what it is |
 | `net bt` | Every Bluetooth LE device within reach: signal, vendor, what kind of device it says it is, name if it sends one |
 | `net bt <name>` | Every field one device advertises; add `--probe` to connect and read its public Device Information service |
@@ -72,6 +73,9 @@ make install        # builds the helper, symlinks `net` into ~/.local/bin
   kernel's unified log; reading 10 minutes of it takes a few seconds.
 - Network names are hidden unless your terminal app has Location Services access
   (System Settings › Privacy & Security › Location Services). Everything else works without it.
+- MAC-address makers come from Wireshark's vendor list, downloaded once (3 MB) into
+  `~/.cache/net-doctor/manuf`. A locally-set address (second hex digit 2, 6, a or e) is either a
+  phone hiding its identity or a router's derived extra BSSID; the latter is reported as "likely …".
 
 ## License
 

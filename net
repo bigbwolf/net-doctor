@@ -2,6 +2,8 @@
 # net — says in plain words why the Mac's internet is failing.
 #   net check   diagnose the current connection and give a verdict
 #   net scan    nearby Wi-Fi networks and channel occupancy
+#   net hidden  hidden networks: vendor, distance, which router they belong to
+#   net devices devices on the connected network; net bt: Bluetooth devices in reach
 # Diagnosis never needs sudo.
 
 set -u
@@ -61,6 +63,29 @@ https_probe() {
   HCODE=${r%% *}; HTIME=${r##* }
   [[ "$HCODE" == "000" || -z "$HCODE" ]] && HCODE=fail
   HTIME=$(awk -v t="$HTIME" 'BEGIN{printf "%d", t*1000}')
+}
+
+# vendor_of MAC -> the maker behind a MAC address, from Wireshark's vendor list (cached once).
+# A locally-set address (2nd hex digit 2/6/a/e) is either a phone hiding its identity or a
+# router's extra BSSID derived from its real one; the latter shows as "likely <vendor>".
+MANUF="${XDG_CACHE_HOME:-$HOME/.cache}/net-doctor/manuf"
+vendor_of() {
+  local -a o; o=(${(s.:.)${(U)1}}); (( ${#o} == 6 )) || return 0
+  local i; for i in {1..6}; do [[ ${#o[i]} == 1 ]] && o[i]="0${o[i]}"; done
+  if [[ ! -s "$MANUF" ]]; then
+    mkdir -p "${MANUF:h}"; print -u2 "  downloading the MAC vendor list (once, 3 MB)…"
+    curl -sL -m 60 -o "$MANUF" https://www.wireshark.org/download/automated/data/manuf || { rm -f "$MANUF"; return 0; }
+  fi
+  local prefix="" local=""
+  if [[ "${o[1][2]}" == [26AE] ]]; then
+    local -A clear; clear=(2 0 6 4 A 8 E C)
+    o[1]="${o[1][1]}${clear[${o[1][2]}]}"; local="likely "
+  fi
+  local k line
+  for k in "${o[1]}:${o[2]}:${o[3]}:${o[4]}:${o[5][1]}0/36" "${o[1]}:${o[2]}:${o[3]}:${o[4][1]}0/28" "${o[1]}:${o[2]}:${o[3]}"; do
+    line=$(grep -m1 "^${k}[[:space:]]" "$MANUF") && { print -r -- "${local}${line##*$'\t'}"; return 0; }
+  done
+  [[ -n "$local" ]] && print "private address"
 }
 
 # ---------- check ------------------------------------------------------------
@@ -246,6 +271,82 @@ cmd_scan() {
   echo; bold "  2.4 GHz"; print -- "  ch 1: $n1 · ch 6: $n6 · ch 11: $n11 · other: $nother"
 }
 
+# ---------- hidden -----------------------------------------------------------
+
+# where_from RSSI -> rough distance for a Wi-Fi access point (they transmit ~100× louder than BLE)
+where_from() {
+  if   (( $1 >= -50 )); then print "right here: this room or through one wall"
+  elif (( $1 >= -65 )); then print "close: this apartment or the one next door"
+  elif (( $1 >= -78 )); then print "a few walls away"
+  else print "far: another floor or building"; fi
+}
+
+cmd_hidden() {
+  need_helper
+  local follow=""; [[ "${1:-}" == "--follow" ]] && follow=1
+  typeset -A CUR; while IFS='=' read -r k v; do CUR[$k]="$v"; done < <(helper info)
+  typeset -A prev
+  local ALL ch w band rssi bssid sec gen cc ssid details vendor same delta n strongest strongest_v own scale
+  while :; do
+    bold "net hidden  $(date '+%H:%M:%S')"
+    print -u2 -n "  scanning…"
+    ALL=$(helper beacons)
+    print -u2 -n "\r\e[2K"
+    n=0 strongest=-200 strongest_v="" own=0
+    # our own network, for scale: by name/address, else the loudest named network on our channel
+    own=$(print -r -- "$ALL" | awk -F$'\x1f' -v s="${CUR[ssid]:-}" -v b="${CUR[bssid]:-}" -v ch="${CUR[channel]:-0}" -v best=-200 -v onch=-200 '
+      $9 != "" && (($9 == s && s != "") || ($5 == b && b != "")) && $4 > best { best = $4 }
+      $9 != "" && $1 == ch && ch != 0 && $4 > onch { onch = $4 }
+      END { print (best > -200 ? best : (onch > -200 ? onch : 0)) }')
+    while IFS=$'\x1f' read -r ch w band rssi bssid sec gen cc ssid details; do
+      [[ -n "$ssid" ]] && continue
+      n=$((n+1))
+      vendor=$(vendor_of "$bssid")
+      if (( rssi > strongest )); then strongest=$rssi; strongest_v=${vendor:-unknown vendor}; fi
+      if [[ -n "$follow" ]]; then
+        delta=""; [[ -n "${prev[$bssid]:-}" ]] && delta=$(printf "%+d" $(( rssi - prev[$bssid] )))
+        printf "  %-9s %-5s %-19s %s\n" "${rssi} dBm" "$delta" "$bssid" "${vendor:-}"
+        prev[$bssid]=$rssi
+        continue
+      fi
+      echo
+      printf "  %-19s %-9s ch %-4s %-8s %-10s %s\n" "$bssid" "${rssi} dBm" "$ch" "${band} GHz" "$sec" "$gen"
+      row "  where" "$(where_from "$rssi")"
+      [[ -n "$vendor" ]] && row "  vendor" "$vendor"
+      # the same box: a router's extra names share the channel and the last two octets of the
+      # address (aa:bb:cc:dd:EE:FF), or all but the last octet
+      same=$(print -r -- "$ALL" | awk -F$'\x1f' -v ch="$ch" -v b="$bssid" '
+        $9 != "" && (($1 == ch && substr($5, 13) == substr(b, 13)) || substr($5, 1, 14) == substr(b, 1, 14)) { print $9; exit }')
+      [[ -n "$same" ]] && row "  router" "the same box that broadcasts $same (its extra, unnamed network)"
+      [[ -n "$details" ]] && row "  beacon" "$details"
+    done <<< "$ALL"
+    if [[ -n "$follow" ]]; then
+      (( n == 0 )) && echo "  no hidden networks in range"
+      echo; sleep 2; continue
+    fi
+    echo
+    if (( n == 0 )); then
+      echo "  No hidden networks in range right now."
+    else
+      scale=""; (( own != 0 )) && scale=" (your own router reads ${own} dBm from here)"
+      if (( strongest >= -50 )) || (( own != 0 && strongest >= own + 5 )); then
+        print -- "  ⚠ The strongest hidden network, ${strongest} dBm from ${strongest_v}, is loud enough to be inside this"
+        print -- "  apartment or in an adjoining wall${scale}. Run \`net hidden --follow\` and walk around: the number"
+        print -- "  climbs as you get closer. Cameras and other small IoT devices usually come from Espressif, Tuya,"
+        print -- "  Realtek, Hikvision, Dahua or an unlisted Shenzhen maker."
+      else
+        print -- "  None of the ${n} hidden network(s) is close: the strongest is ${strongest} dBm${scale}."
+        print -- "  A camera in this apartment would be the loudest thing in the list. These are neighbours' routers'"
+        print -- "  extra names, mesh backhaul links or set-up hotspots."
+      fi
+    fi
+    dim "  Hidden means only the name is withheld; the address, maker and radio details are still broadcast."
+    dim "  A camera that joins a Wi-Fi network instead of making its own shows in \`net devices\`, not here;"
+    dim "  one that records to a card or a wire emits nothing on Wi-Fi: try \`net bt\`."
+    break
+  done
+}
+
 # ---------- devices ----------------------------------------------------------
 
 # probe_device IP MAC -> what one LAN device reveals without credentials
@@ -258,8 +359,9 @@ probe_device() {
   [[ -n "$mac" ]] && {
     # second hex digit with bit 1 set = locally administered = randomized/private address
     local b2=${mac%%:*}; b2=${(L)b2}; [[ ${#b2} == 1 ]] && b2="0$b2"
-    local priv=""; [[ "${b2:1:1}" == [26ae] ]] && priv=" (private/randomized address, vendor not identifiable)"
+    local priv=""; [[ "${b2:1:1}" == [26ae] ]] && priv=" (private/randomized address)"
     row "mac" "$mac$priv"
+    local vendor; vendor=$(vendor_of "$mac"); [[ -n "$vendor" && "$vendor" != "private address" ]] && row "vendor" "$vendor"
   }
   row "mDNS name" "${name:--}"
   # Apple devices publish their model over mDNS
@@ -317,8 +419,8 @@ cmd_devices() {
   local i; for i in {1..254}; do ping -c 1 -W 500 -t 1 -q "${IP%.*}.$i" >/dev/null 2>&1 & done; wait
   print -u2 -n "\r\e[2K"
   echo
-  printf "  %-16s %-18s %s\n" address mac name
-  local n=0 line ip mac name
+  printf "  %-16s %-18s %-20s %s\n" address mac vendor name
+  local n=0 line ip mac name vendor
   # arp -an is instant; names come from a one-shot mDNS reverse query per device, which
   # Apple and most modern devices answer with their own name
   arp -an -i "$IF" 2>/dev/null | grep -v incomplete | sort -t. -k4 -n | while read -r line; do
@@ -329,9 +431,10 @@ cmd_devices() {
     name=${name%.local.}
     [[ "$ip" == "$GW" ]] && name="${name:+$name }(router)"
     n=$((n+1))
-    printf "  %-16s %-18s %s\n" "$ip" "$mac" "$name"
+    vendor=$(vendor_of "$mac")
+    printf "  %-16s %-18s %-20.20s %s\n" "$ip" "$mac" "${vendor:--}" "$name"
   done
-  printf "  %-16s %-18s %s\n" "$IP" "$(ifconfig "$IF" | awk '/ether/{print $2}')" "$(scutil --get LocalHostName 2>/dev/null) (this Mac)"
+  printf "  %-16s %-18s %-20.20s %s\n" "$IP" "$(ifconfig "$IF" | awk '/ether/{print $2}')" "Apple" "$(scutil --get LocalHostName 2>/dev/null) (this Mac)"
   echo
   local total; total=$(arp -an -i "$IF" 2>/dev/null | grep -v incomplete | grep -v "($IP)" | grep -c "(${IP%.*}\.[0-9]*)")
   echo "  $total other device(s) on the network right now."
@@ -407,6 +510,7 @@ cmd_auth() {
 case "${1:-}" in
   check) cmd_check ;;
   scan)  cmd_scan ;;
+  hidden) cmd_hidden "${2:-}" ;;
   devices) cmd_devices "${2:-}" ;;
   bt)    cmd_bt "${2:-}" "${3:-}" ;;
   auth)  cmd_auth ;;
@@ -416,6 +520,7 @@ net — says in plain words why the Mac's internet is failing
 
   net check   diagnose the current connection and give a verdict
   net scan    nearby Wi-Fi networks and which channel block is quietest
+  net hidden  what the hidden networks around you are and whether one is in this apartment; --follow to walk and watch
   net devices every device on the network you are connected to; `net devices <ip>` probes one
   net bt      every Bluetooth device within reach; `net bt <name>` shows everything one device advertises
   net auth    one-time: allow Location Services so scan shows network names

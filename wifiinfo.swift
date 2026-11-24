@@ -1,6 +1,7 @@
 // wifiinfo — tiny CoreWLAN helper for `net`, built into net-doctor.app.
 //   wifiinfo info [--out FILE]   key=value lines about the current Wi-Fi link
 //   wifiinfo scan [--out FILE]   one line per nearby network: channel width band rssi bssid ssid
+//   wifiinfo beacons [--out FILE] scan plus security, Wi-Fi generation and beacon tags (0x1F-separated)
 //   wifiinfo auth [--out FILE]   request Location Services (needed for network names)
 //   wifiinfo bt   [--out FILE]   nearby Bluetooth LE devices: rssi vendor kind name id
 //
@@ -83,6 +84,113 @@ func securityName(_ s: CWSecurity) -> String {
     case .OWE, .oweTransition: return "OWE"
     default: return "unknown"
     }
+}
+
+/// Strongest security a scanned network offers.
+func securityOf(_ n: CWNetwork) -> String {
+    let order: [(CWSecurity, String)] = [
+        (.wpa3Enterprise, "Enterprise"), (.wpa2Enterprise, "Enterprise"), (.enterprise, "Enterprise"),
+        (.wpaEnterprise, "Enterprise"), (.wpaEnterpriseMixed, "Enterprise"),
+        (.wpa3Personal, "WPA3"), (.wpa3Transition, "WPA2/WPA3"), (.wpa2Personal, "WPA2"), (.personal, "WPA2"),
+        (.wpaPersonalMixed, "WPA"), (.wpaPersonal, "WPA"), (.OWE, "OWE"), (.oweTransition, "OWE"),
+        (.WEP, "WEP"), (.none, "open"),
+    ]
+    for (s, name) in order where n.supportsSecurity(s) { return name }
+    return "unknown"
+}
+
+// ---------- beacon information elements ----------
+// A hidden network withholds only its name; its beacons still carry the chipset vendor's
+// tags and, when WPS or Wi-Fi Direct is on, the maker, model and device type in plain text.
+
+let chipOUIs: [String: String] = [
+    "00:10:18": "Broadcom", "00:90:4C": "Broadcom", "00:0C:43": "MediaTek", "00:0C:E7": "MediaTek",
+    "00:E0:4C": "Realtek", "00:03:7F": "Qualcomm Atheros", "00:13:74": "Qualcomm Atheros",
+    "8C:FD:F0": "Qualcomm", "00:A0:C6": "Qualcomm", "00:17:F2": "Apple", "00:15:6D": "Ubiquiti",
+    "00:0C:42": "MikroTik", "00:1A:11": "Google", "00:40:96": "Cisco", "00:0B:86": "Aruba",
+    "00:13:92": "Ruckus", "00:26:86": "Quantenna", "00:50:43": "Marvell", "00:16:32": "Samsung",
+    "00:14:6C": "Netgear", "00:1C:DF": "Belkin", "F8:32:E4": "TP-Link", "00:25:9C": "Linksys",
+]
+let deviceCategories: [Int: String] = [
+    1: "computer", 2: "input device", 3: "printer", 4: "camera", 5: "storage", 6: "network device",
+    7: "display", 8: "media player", 9: "game console", 10: "phone", 11: "audio",
+]
+
+func hex(_ b: UInt8) -> String { String(format: "%02X", b) }
+func cleanStr(_ bytes: ArraySlice<UInt8>) -> String {
+    String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters))
+}
+
+/// WPS attributes (2-byte id, 2-byte length, big-endian) starting at `start`.
+func wpsFields(_ b: [UInt8], from start: Int) -> [String] {
+    var i = start, f: [String: String] = [:]
+    while i + 4 <= b.count {
+        let id = Int(b[i]) << 8 | Int(b[i + 1]), len = Int(b[i + 2]) << 8 | Int(b[i + 3]); i += 4
+        guard i + len <= b.count else { break }
+        let v = b[i..<i + len]; i += len
+        switch id {
+        case 0x1021: f["maker"] = cleanStr(v)
+        case 0x1023: f["model"] = cleanStr(v)
+        case 0x1024: f["model no."] = cleanStr(v)
+        case 0x1011: f["name"] = cleanStr(v)
+        case 0x1054 where len >= 2: f["type"] = deviceCategories[Int(v[v.startIndex]) << 8 | Int(v[v.startIndex + 1])]
+        default: break
+        }
+    }
+    return ["type", "maker", "model", "model no.", "name"].compactMap { k in
+        guard let v = f[k], !v.isEmpty else { return nil }
+        return "\(k) \(v)"
+    }
+}
+
+/// Wi-Fi Direct (P2P) Device Info attribute: type and device name.
+func p2pFields(_ b: [UInt8]) -> [String] {
+    var i = 4, out: [String] = []
+    while i + 3 <= b.count {
+        let id = b[i], len = Int(b[i + 1]) | Int(b[i + 2]) << 8; i += 3
+        guard i + len <= b.count else { break }
+        if id == 0x0D && len >= 17 {
+            let v = Array(b[i..<i + len])
+            if let c = deviceCategories[Int(v[8]) << 8 | Int(v[9])] { out.append("type \(c)") }
+            let nameAt = 17 + Int(v[16]) * 8
+            if nameAt + 4 <= v.count, v[nameAt] == 0x10, v[nameAt + 1] == 0x11 {
+                let n = Int(v[nameAt + 2]) << 8 | Int(v[nameAt + 3])
+                if nameAt + 4 + n <= v.count { out.append("name " + cleanStr(v[nameAt + 4..<nameAt + 4 + n])) }
+            }
+        }
+        i += len
+    }
+    return out
+}
+
+/// Wi-Fi generation, country code and anything identifying in a network's beacon.
+func parseIEs(_ data: Data?) -> (gen: String, country: String, details: [String]) {
+    guard let data = data else { return ("", "", []) }
+    let b = [UInt8](data)
+    var i = 0, ht = false, vht = false, he = false, eht = false, country = ""
+    var chips = Set<String>(), details: [String] = []
+    while i + 2 <= b.count {
+        let id = Int(b[i]), len = Int(b[i + 1]); i += 2
+        guard i + len <= b.count else { break }
+        let v = Array(b[i..<i + len]); i += len
+        switch id {
+        case 7 where len >= 2: country = cleanStr(v[0..<2])
+        case 45: ht = true
+        case 191: vht = true
+        case 255 where len >= 1: if v[0] == 35 { he = true } else if v[0] == 108 { eht = true }
+        case 221 where len >= 4:
+            let oui = "\(hex(v[0])):\(hex(v[1])):\(hex(v[2]))"
+            if oui == "00:50:F2" && v[3] == 4 {
+                let f = wpsFields(v, from: 4); if !f.isEmpty { details.append("WPS: " + f.joined(separator: ", ")) }
+            } else if oui == "50:6F:9A" && v[3] == 9 {
+                let f = p2pFields(v); if !f.isEmpty { details.append("Wi-Fi Direct: " + f.joined(separator: ", ")) }
+            } else if let c = chipOUIs[oui] { chips.insert(c) }
+        default: break
+        }
+    }
+    let gen = eht ? "Wi-Fi 7" : he ? "Wi-Fi 6" : vht ? "Wi-Fi 5" : ht ? "Wi-Fi 4" : "legacy"
+    if !chips.isEmpty { details.append("chip: " + chips.sorted().joined(separator: "/")) }
+    return (gen, country, details)
 }
 
 // ---------- location session ----------
@@ -172,6 +280,24 @@ case "scan":
     for n in sorted {
         let ch = n.wlanChannel
         emit("\(ch?.channelNumber ?? 0)\t\(widthMHz(ch?.channelWidth ?? .widthUnknown))\t\(bandName(ch?.channelBand ?? .bandUnknown))\t\(n.rssiValue)\t\(n.bssid ?? "")\t\(n.ssid ?? "")")
+    }
+    finish(0)
+
+case "beacons":
+    // Like scan, with everything else the beacon says. Unit-separated (0x1F) because the
+    // last field is free text: ch width band rssi bssid security gen country ssid details
+    _ = startLocation(waitUpTo: 2)
+    var seen: [String: CWNetwork] = [:]
+    for _ in 0..<2 {
+        guard let nets = try? iface.scanForNetworks(withSSID: nil) else { continue }
+        for n in nets { seen[n.bssid ?? "\(n.wlanChannel?.channelNumber ?? 0)/\(n.rssiValue)/\(n.ssid ?? "")"] = n }
+    }
+    for n in seen.values.sorted(by: { $0.rssiValue > $1.rssiValue }) {
+        let ch = n.wlanChannel, ie = parseIEs(n.informationElementData)
+        let ssid = (n.ssid ?? "").trimmingCharacters(in: .controlCharacters)
+        emit(["\(ch?.channelNumber ?? 0)", "\(widthMHz(ch?.channelWidth ?? .widthUnknown))", bandName(ch?.channelBand ?? .bandUnknown),
+              "\(n.rssiValue)", n.bssid ?? "", securityOf(n), ie.gen, ie.country, ssid,
+              ie.details.joined(separator: " · ")].joined(separator: "\u{1F}"))
     }
     finish(0)
 
